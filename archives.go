@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"image"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/nwaples/rardecode"
 )
@@ -37,39 +37,39 @@ func processZip(rs io.ReadSeeker, src *Source, opts Options,
 		return
 	}
 
-	switch rs.(type) {
+	switch rs := rs.(type) {
 	case *os.File:
-		err = useFile(rs.(*os.File))
+		err = useFile(rs)
 		if err != nil {
 			return
 		}
 	case *bytes.Reader:
-		r := rs.(*bytes.Reader)
+		r := rs
 		ra = r
 		size = r.Size()
 	default:
 		// Dump exotic io.ReadSeeker to file and use that
 		var tmp *os.File
-		tmp, err = ioutil.TempFile("", "")
+		tmp, err = os.CreateTemp("", "")
 		if err != nil {
-			return
+			return nil, err
 		}
 		defer os.Remove(tmp.Name())
 		defer tmp.Close()
 
 		_, err = io.Copy(tmp, rs)
 		if err != nil {
-			return
+			return nil, err
 		}
 		err = useFile(tmp)
 		if err != nil {
-			return
+			return nil, err
 		}
 	}
 
 	r, err := zip.NewReader(ra, size)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	var (
@@ -114,7 +114,7 @@ func couldBeImage(name string) bool {
 		return false
 	}
 	name = strings.ToLower(name[len(name)-4:])
-	for _, ext := range [...]string{".png", ".jpg", ".jpeg", ".webp"} {
+	for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp"} {
 		if strings.HasSuffix(name, ext) {
 			return true
 		}
@@ -122,49 +122,49 @@ func couldBeImage(name string) bool {
 	return false
 }
 
-// Thumbnail image in from an arechive
-func thumbnailArchiveImage(r io.Reader, opts Options, sizeLimit int64,
-) (thumb image.Image, err error) {
+// Thumbnail image in from an archive
+func thumbnailArchiveImage(r io.Reader, opts Options, sizeLimit int64) (thumb image.Image, err error) {
 	// Accept anything we can process
 	opts.AcceptedMimeTypes = nil
 
 	// Compressed files do not provide seeking.
 	// Temporary file to conserve RAM.
-	tmp, err := ioutil.TempFile("", "")
+	tmp, err := os.CreateTemp("", "")
 	if err != nil {
-		goto end
+		return nil, err
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	defer func() {
+		os.Remove(tmp.Name())
+		tmp.Close()
+	}()
 
 	// LimitReader protects against decompression bombs
 	_, err = io.Copy(tmp, io.LimitReader(r, sizeLimit))
 	if err != nil {
-		goto end
+		return nil, err
 	}
 
 	_, thumb, err = Process(tmp, opts)
-
-end:
 	if err != nil {
 		err = ErrArchive{err}
 	}
-	return
+	return thumb, err
 }
 
 // Thumbnail the first image of a rar file
-func processRar(rs io.ReadSeeker, src *Source, opts Options,
-) (thumb image.Image, err error) {
+func processRar(rs io.ReadSeeker, src *Source, opts Options) (thumb image.Image, err error) {
 	dec, err := rardecode.NewReader(rs, "")
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	var (
 		imageCount = 0
 		i          = 0
 		h          *rardecode.FileHeader
+		wg         sync.WaitGroup
 	)
+
 	// Only check the first 10 files. We don't need to check them all.
 	for i = 0; i < 10; i++ {
 		h, err = dec.Next()
@@ -172,32 +172,46 @@ func processRar(rs io.ReadSeeker, src *Source, opts Options,
 		case nil:
 		case io.EOF:
 			err = nil
-			goto endLoop
 		default:
-			return
+			return nil, err
 		}
-		if couldBeImage(h.Name) {
-			imageCount++
-			if imageCount == 1 {
-				thumb, err = thumbnailArchiveImage(dec, opts, 100<<20)
-				if err != nil {
+		if err != nil {
+			break
+		}
+		if h.IsDir {
+			continue
+		}
+		wg.Add(1)
+
+		go func(header *rardecode.FileHeader) {
+			defer wg.Done()
+
+			if couldBeImage(header.Name) {
+				localThumb, localErr := thumbnailArchiveImage(dec, opts, 100<<20)
+				if localErr != nil {
+					err = localErr
 					return
+				} else if localThumb != nil {
+					imageCount++
+					if imageCount == 1 {
+						thumb = localThumb
+					}
 				}
 			}
-		}
-	}
-endLoop:
-	if thumb == nil {
-		err = ErrCantThumbnail
-		return
+		}(h)
 	}
 
-	// If at least 90% of first 10 files in the archive are images, this is a
-	// comic archive
+	wg.Wait()
+
+	if thumb == nil {
+		return nil, ErrCantThumbnail
+	}
+
+	// If at least 90% of the first 10 files in the archive are images, this is a comic archive
 	if float32(imageCount)/float32(i) >= 0.9 {
 		src.Mime = "application/vnd.comicbook-rar"
 		src.Extension = "cbr"
 	}
 
-	return
+	return thumb, nil
 }

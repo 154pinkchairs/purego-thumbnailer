@@ -1,55 +1,30 @@
 package thumbnailer
 
-// #include "thumbnailer.h"
-// #include <libavutil/log.h>
-import "C"
 import (
+	"bytes"
+	"fmt"
 	"image"
 	"io"
-	"unsafe"
-)
+	"os"
 
-func init() {
-	C.av_log_set_level(C.AV_LOG_ERROR)
-}
+	ffmpeg "github.com/u2takey/ffmpeg-go"
+)
 
 // Thumbnail generates a thumbnail from a representative frame of the media.
 // Images count as one frame media.
-func (c *FFContext) Thumbnail(dims Dims) (thumb image.Image, err error) {
-	ci, err := c.codecContext(FFVideo)
+func Thumbnail(dims Dims, inputFile string) (thumb image.Image, err error) {
+	buf := bytes.NewBuffer(nil)
+	err = ffmpeg.Input(inputFile).
+		Filter("select", ffmpeg.Args{fmt.Sprintf("eq(n,%d)", 0)}).
+		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
+		WithOutput(buf, os.Stdout).
+		Run()
 	if err != nil {
-		return
+		return nil, err
 	}
 
-	var img C.struct_Buffer
-	defer func() {
-		if img.data != nil {
-			C.free(unsafe.Pointer(img.data))
-		}
-	}()
-	ret := C.generate_thumbnail(&img, c.avFormatCtx, ci.ctx, ci.stream,
-		C.struct_Dims{
-			width:  C.uint64_t(dims.Width),
-			height: C.uint64_t(dims.Height),
-		})
-	switch {
-	case ret != 0:
-		err = castError(ret)
-	case img.data == nil:
-		err = ErrGetFrame
-	default:
-		thumb = &image.RGBA{
-			Pix:    copyCBuffer(img),
-			Stride: 4 * int(img.width),
-			Rect: image.Rectangle{
-				Max: image.Point{
-					X: int(img.width),
-					Y: int(img.height),
-				},
-			},
-		}
-	}
-	return
+	thumb, _, err = image.Decode(buf)
+	return thumb, err
 }
 
 func processMedia(rs io.ReadSeeker, src *Source, opts Options,
